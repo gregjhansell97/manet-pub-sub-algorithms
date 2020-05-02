@@ -3,6 +3,7 @@
 
 import math
 from multiprocessing import Barrier, Process, Queue
+import pickle
 import queue
 import random as rand
 from threading import Thread
@@ -119,21 +120,16 @@ def random_waveform_worker(*,
     for nid, t in trxs.items():
         recv_logs[nid] = t.recv_log
 
-
-
     pub_logs_q.put(pub_logs)
     sub_logs_q.put(sub_logs)
-    #print("I'm blocked here")
-    #send_logs_q.put(send_logs)
-    #recv_logs_q.put(recv_logs)
-    #print("JK")
 
 def create_gossip_router(**kwargs):
-    #return HintRouter(**kwargs)
-    return GossipRouter(**kwargs, gossip_level=1)
+    return HintRouter(**kwargs, beacon_interval=5, credit=2)
+    #return GossipRouter(**kwargs, gossip_level=1)
 
 def random_waveform_benchmark():
-    rand.seed(32)
+    title = "hint_2_seed_47"
+    rand.seed(47)
     # PARAMETERS
     # VEHICLE
     vehicle_speed = (10, 20) # meters per second
@@ -141,21 +137,16 @@ def random_waveform_benchmark():
     x_bound = (0, 1000) # meters
     y_bound = (0, 1000) #meters
     # TIME
-    clock_speed = 0.25# second per second
-    simulation_duration = 15 # seconds
+    clock_speed = 0.5# second per second
+    simulation_duration = 125 #60 # seconds
     # PARTICIPANTS
     # two publishers
     # first 20 publish
-    pubs = [(i, 1, i//2 + 0.2) for i in range(20)]
-    #pubs = [(i, 1, i + 0.2) for i in range(10)]
-    #pubs += [(i + 10, 1, i + 0.2) for i in range(10)]
-    print(pubs)
-    #pubs = [(0, 1, i + 0.25) for i in range(10)] # node-id, topic, pub-time
-    #pubs += [(0, 1, i + 0.75) for i in range(10)] # node-id, topic, pub-time
-    #pubs += [(1, 1, i + 0.25) for i in range(10)] # node-id, topic, pub-time
-    #pubs += [(1, 1, i + 0.75) for i in range(10)] # node-id, topic, pub-time
+    #pubs = [(i%100, 1, i//2 + 0.2) for i in range(120)]
+    pubs = [(i, 1, i*2 + 0.2) for i in range(60)]
     # 10 subscribers
-    subs = {i: [1] for i in range(20, 30)} # node i is interested in topic 1
+    #subs = {i: [1] for i in range(20, 30)} # node i is interested in topic 1
+    subs = {i: [1] for i in range(60, 70)} # node i is interested in topic 1
     node_ids = list(range(100))
     #node_ids = list(range(10))
     # MULTIPROCESSING
@@ -164,11 +155,10 @@ def random_waveform_benchmark():
     # TRANSCEIVER
     trx_kwargs = {
             "world": str(uuid.uuid4()),
-            "send_duration": 0.01,
-            "recv_duration": 0.001,
-            "send_range": 125,
-            "recv_range": 125,
-            "max_buffer_size": math.inf
+            "data_rate": 2000, #kbps
+            "send_range": 75,
+            "recv_range": 75,
+            "max_buffer_size": 1024
     }
     paths = {}
     for nid in node_ids:
@@ -286,6 +276,16 @@ def random_waveform_benchmark():
     print(f"Bytes Transmitted: {total_bytes}")
     print(f"Num Sends: {num_sends}")
 
+    logs = {
+            "pub": pub_logs,
+            "sub": sub_logs,
+            "send": send_logs,
+            "recv": recv_logs,
+            "paths": paths
+        }
+    with open(f"{title}.pickle", "xb") as f:
+        pickle.dump(logs, f)
+    print("ALL DONE :)")
 
     return
 

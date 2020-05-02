@@ -10,10 +10,11 @@ from hmap.interface.routing import Router
 
 class HintRouter(Router):
     def __init__(self, *, 
-            matcher, context, transceiver, beacon_interval=1, credit=1
+            matcher, context, transceiver, beacon_interval=2, credit=1
             ): 
         super().__init__(matcher=matcher)
         # communication and context
+        self.__max_hint = 10
         self.__ctx = context
         self.__trx_lock = Lock()
         self.__trx = transceiver
@@ -24,6 +25,7 @@ class HintRouter(Router):
         self.__dt = beacon_interval
         self.__nid = context.uid # node id
         # interest: uid map
+        self.__nbrs_lock = Lock()
         self.__nbrs = self.Interest.Map()
         # raw_subscriptions and last beacon of neighbors
         self.__hint_table = {}
@@ -90,29 +92,24 @@ class HintRouter(Router):
             # broker neighbors are new or not in destination
             nbrs = self.__nbrs.match(event) # find all matching neighbors
             for nid in nbrs:
+                interests, last = self.__hint_table[nid]
+                if last > self.__max_hint: # ignore nbrs that you haven't hear from in a while
+                    continue
                 try:
-                    interests, last = self.__hint_table[nid]
-                except KeyError:
-                    print("###################")
-                    print(list(nbrs))
-                    print(self.__hint_table)
-                    print("###################")
-                else:
-                    try:
-                        # (2) hint for nid is less than one in message
-                        if destinations[nid] > last:
-                            destinations[nid] = last
-                            forward_delay = min(forward_delay, 0.05*last)
-                    except KeyError: # (1) nid doesn't belong to destinations
+                    # (2) hint for nid is less than one in message
+                    if destinations[nid] > last:
                         destinations[nid] = last
-                        forward_delay = min(forward_delay, 0.05*last)
-        if forward_delay == math.inf:
+                        forward_delay = min(forward_delay, 0.1*last)
+                except KeyError: # (1) nid doesn't belong to destinations
+                    destinations[nid] = last
+                    forward_delay = min(forward_delay, 0.1*last)
+        if forward_delay == math.inf: # use credits instead
             # NO NEW CHANGES WERE APPLIED
             if credit > 0: # credit to send message off anyways
                 credit -= 1 # decrement 
                 content = (mid, destinations, credit, raw_event)
                 msg = ("message", content)
-                self.__scheduled[mid] = (current_time, msg)
+                self.__scheduled[mid] = (current_time + 0.1*self.__max_hint, msg)
         else: # forward delay changed, good to send
             content = (mid, destinations, credit, raw_event)
             msg = ("message", content)
@@ -121,19 +118,22 @@ class HintRouter(Router):
         self.__stale.add(mid)
 
     def notify_router(self, event):
-        destinations = {}
-        nbrs = self.__nbrs.match(event)
-        destinations = {
-                nid: self.__hint_table[nid][1]
-                for nid in nbrs}
-        mid = (self.__nid, self.__msg_timestamp)
-        raw_event = self.Event.serialize(event)
-        content = (mid, destinations, self.__credit, raw_event)
-        msg = ("message", content)
-        messages = [("message", content)] # messages of size 1
-        with self.__trx_lock:
-            self.__trx.send(pickle.dumps(messages))
-        self.__msg_timestamp += 1
+        with self.__nbrs_lock:
+            destinations = {}
+            nbrs = self.__nbrs.match(event)
+            for nid in nbrs:
+                interests, last = self.__hint_table[nid]
+                if last > self.__max_hint: # ignore
+                    continue
+                destinations[nid] = last
+            mid = (self.__nid, self.__msg_timestamp)
+            raw_event = self.Event.serialize(event)
+            content = (mid, destinations, self.__credit, raw_event)
+            msg = ("message", content)
+            messages = [("message", content)] # messages of size 1
+            with self.__trx_lock:
+                self.__trx.send(pickle.dumps(messages))
+            self.__msg_timestamp += 1
 
     def close(self):
         self.__trx.close()
@@ -141,61 +141,76 @@ class HintRouter(Router):
 
     def recv_loop(self):
         next_beacon_time = self.__ctx.time
+        timeout = 0
         while True:
             try:
                 # wait as long as beacon interval
-                timeout = next_beacon_time - self.__ctx.time
+                if timeout < 0:
+                    timeout = 0
                 raw_data = self.__trx.recv(timeout=timeout)
             except EOFError:
                 return
             # check if next beacon time
-            if next_beacon_time < self.__ctx.time: # increment hint table
-                next_hint_table = {}
-                for nid, v in self.__hint_table.items():
-                    raw_interest, hint = v
-                    if hint < 10:
+            with self.__nbrs_lock:
+                if next_beacon_time < self.__ctx.time: # increment hint table
+                    next_hint_table = {}
+                    for nid, v in self.__hint_table.items():
+                        raw_interest, hint = v
+                       # if hint < 10:
                         next_hint_table[nid] = (raw_interest, hint + 1)
-                    else: # over 10 remove from nbrs too
-                        for ri in raw_interests:
-                            i = self.Interest.deserialize(ri)
-                            self.__nbrs.remove(i, nid)
-                self.__hint_table = next_hint_table
-                # reset beacon time
-                next_beacon_time = self.__ctx.time + self.__dt
-                # schedule beacon message
-                raw_interests = tuple(
-                        self.Interest.serialize(i) 
-                        for i in self.local_interests)
-                if len(raw_interests) > 0: # has something worth beaconing
-                    content = (self.__nid, raw_interests)
-                    msg = ("beacon", content)
-                    # schedule beacon
-                    self.__scheduled[str(self.__nid)] = (
-                            self.__ctx.time, msg)
-            elif len(raw_data) > 0: # received data
-                # extract data
-                messages = pickle.loads(raw_data) # list of messages
-                for raw_data in messages:
-                    channel, content = raw_data
-                    if channel == "beacon":
-                        self.on_beacon(content) # update tables
-                    elif channel == "message":
-                        self.on_message(content)
-            # send off any scheduled messages
-            current_time = self.__ctx.time
-            messages = tuple(
-                    msg 
-                    for t, msg in self.__scheduled.values() 
-                    if t <= current_time)
-            # send messages globbed together
-            if len(messages) > 0:
-                with self.__trx_lock:
-                    self.__trx.send(pickle.dumps(messages))
-            # filter out old scheduled items
-            self.__scheduled = {
-                    k: v
-                    for k, v in self.__scheduled.items()
-                    if v[0] > current_time}
+                       # else: # over 10 remove from nbrs too
+                       #     for ri in raw_interests:
+                       #         i = self.Interest.deserialize(ri)
+                       #         self.__nbrs.remove(i, nid)
+                    self.__hint_table = next_hint_table
+                    # reset beacon time
+                    next_beacon_time = self.__ctx.time + self.__dt
+                    # schedule beacon message
+                    raw_interests = tuple(
+                            self.Interest.serialize(i) 
+                            for i in self.local_interests)
+                    if len(raw_interests) > 0: # has something worth beaconing
+                        content = (self.__nid, raw_interests)
+                        msg = ("beacon", content)
+                        # schedule beacon
+                        self.__scheduled[str(self.__nid)] = (
+                                self.__ctx.time, msg)
+                if len(raw_data) > 0: # received data
+                    # extract data
+                    messages = pickle.loads(raw_data) # list of messages
+                    for raw_data in messages:
+                        channel, content = raw_data
+                        if channel == "beacon":
+                            self.on_beacon(content) # update tables
+                        elif channel == "message":
+                            self.on_message(content)
+                # send off any scheduled messages
+                current_time = self.__ctx.time
+                messages = []
+                next_schedule = {}
+                timeout = next_beacon_time - current_time
+                for k, v in self.__scheduled.items():
+                    t, m = v
+                    if t <= current_time:
+                        messages.append(m)
+                    else:
+                        timeout = min(timeout, t - current_time)
+                        next_schedule[k] = (t, m)
+                self.__scheduled = next_schedule
+                messages = tuple(messages)
+                #messages = tuple(
+                #        msg 
+                #        for t, msg in self.__scheduled.values() 
+                #        if t <= current_time)
+                # send messages globbed together
+                if len(messages) > 0:
+                    with self.__trx_lock:
+                        self.__trx.send(pickle.dumps(messages))
+                # filter out old scheduled items
+                #self.__scheduled = {
+                #        k: v
+                #        for k, v in self.__scheduled.items()
+                #        if v[0] > current_time}
         
 
 
